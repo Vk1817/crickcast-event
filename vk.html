@@ -896,58 +896,105 @@ async function fetchJson(url){
   catch(err){ throw new Error("Invalid JSON: " + err.message); }
 }
 
+function parseSportsFeedTime(value){
+  if(!value) return null;
+  const text = String(value).replace(/🔴|🟢|🟡/g, "").trim();
+  const match = text.match(/(TODAY|TOMORROW|YESTERDAY)?\s*[·,–-]*\s*(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+  if(!match) return parseDate(text);
+
+  const dayWord = (match[1] || "TODAY").toUpperCase();
+  const now = new Date();
+  const date = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if(dayWord === "TOMORROW") date.setDate(date.getDate() + 1);
+  if(dayWord === "YESTERDAY") date.setDate(date.getDate() - 1);
+
+  let hour = Number(match[2]);
+  const minute = Number(match[3]);
+  const ampm = match[4].toUpperCase();
+  if(ampm === "PM" && hour !== 12) hour += 12;
+  if(ampm === "AM" && hour === 12) hour = 0;
+  date.setHours(hour, minute, 0, 0);
+  return date;
+}
+
 function normalize(data){
-  const list = Array.isArray(data) ? data : (data && Array.isArray(data.events) ? data.events : null);
-  if(!list) throw new Error("Expected an events array.");
+  // sports.json: { last_updated, telegram, total, matches: [...] }
+  // Older array/events feeds remain supported.
+  const isSportsFeed = data && Array.isArray(data.matches);
+  const list = isSportsFeed ? data.matches :
+    (Array.isArray(data) ? data : (data && Array.isArray(data.events) ? data.events : null));
+  if(!list) throw new Error("Expected a matches array in sports.json.");
+
   const events = [];
   let ok = 0, skipped = 0;
 
   list.forEach((item, index) => {
     try{
-      const info = item.event || {};
-      const st = parseDate(info.startTimeIST) || parseDate(info.startTime) || parseDate(item.startTime);
-      if(!st){ skipped++; return; }
-      let en = parseDate(info.endTimeIST) || parseDate(info.endTime) || parseDate(item.endTime);
-      if(!en || en <= st) en = new Date(st.getTime() + 3 * 3600000);
+      let st, en, sport, comp, teamA, teamB, rawStreams;
 
-      const rawStreams = Array.isArray(item.streams) ? item.streams : [];
+      if(isSportsFeed){
+        st = parseSportsFeedTime(item.time);
+        if(!st){ skipped++; return; }
+        en = new Date(st.getTime() + 3 * 3600000);
+        sport = String(item.category || "Other").trim();
+        comp = String(item.title || "").trim();
+        const sides = comp.split(/\s+vs\.?\s+/i);
+        teamA = sides[0] || comp;
+        teamB = sides.length > 1 ? sides.slice(1).join(" vs ") : "";
+        rawStreams = Array.isArray(item.streams) ? item.streams : [];
+      }else{
+        const info = item.event || {};
+        st = parseDate(info.startTimeIST) || parseDate(info.startTime) || parseDate(item.startTime);
+        if(!st){ skipped++; return; }
+        en = parseDate(info.endTimeIST) || parseDate(info.endTime) || parseDate(item.endTime);
+        if(!en || en <= st) en = new Date(st.getTime() + 3 * 3600000);
+        sport = String(info.category || info.name || item.cat || "Other").trim();
+        comp = String(info.type || info.name || item.title || "").trim();
+        teamA = info.teamA || info.home || "";
+        teamB = info.teamB || info.away || "";
+        rawStreams = Array.isArray(item.streams) ? item.streams : [];
+      }
+
       const seen = new Set();
       const streams = [];
       rawStreams.forEach((s, i) => {
         if(!s) return;
-        const link = String(s.link || s.url || "").split("|")[0].trim();
-        if(!link || !/^https?:\/\//i.test(link)) return;
-        if(seen.has(link)) return;
-        const t = String(s.type || "").toLowerCase();
-        const isDash = t === "dash" || /\.mpd(\?|$)/i.test(link);
-        const isHls  = t === "hls"  || t === "0" || /\.m3u8(\?|$)/i.test(link);
-        if(!isDash && !isHls) return;
+        const rawLink = String(s.link || s.url || "").trim();
+        const link = rawLink.split("|")[0].trim();
+        if(!link || !/^https?:\/\//i.test(link) || seen.has(link)) return;
+
+        const type = String(s.type || "").toLowerCase();
+        const isDash = type === "dash" || type === "mpd" || /\.mpd(?:[?#]|$)/i.test(link);
+        const isHls = type === "hls" || type === "m3u8" || type === "0" || /\.m3u8(?:[?#]|$)/i.test(link);
+        const isDirect = type === "direct";
+        if(!isDash && !isHls && !isDirect) return;
+
         seen.add(link);
         streams.push({
           title: String(s.title || s.name || `Stream ${i+1}`).trim(),
           link,
-          type: isDash ? "DASH" : "HLS",
+          type: isDash ? "DASH" : isHls ? "HLS" : "DIRECT",
           key: String(s.api || s.key || "").trim()
         });
       });
 
       events.push({
         id: item.id ?? String(index),
-        sport: String(info.category || info.name || item.cat || "Other").trim(),
-        comp: String(info.type || info.name || item.title || "").trim(),
-        a: info.teamA || info.home || "",
-        b: info.teamB || info.away || "",
-        fa: info.teamAFlag || info.homeFlag || "",
-        fb: info.teamBFlag || info.awayFlag || "",
+        sport, comp, a: teamA, b: teamB,
+        fa: item.teamAFlag || item.homeFlag || "",
+        fb: item.teamBFlag || item.awayFlag || "",
         st, en, streams
       });
       ok++;
-    }catch(err){ ERR(`Event #${index} error:`, err); skipped++; }
+    }catch(err){
+      ERR(`Event #${index} error:`, err);
+      skipped++;
+    }
   });
+
   LOG(`Normalize done — ok=${ok}, skipped=${skipped}`);
   return events;
 }
-
 async function loadData(){
   try{
     const raw = await fetchJson(DATA_URL);
